@@ -1,8 +1,8 @@
 # simd-gpu
 
-A 4-core SIMD GPU implementation with a 128-bit datapath, dual-port SRAM, and warp-based dispatching — built to explore how real GPU parallelism works from the ground up.
+A single-core SIMD GPU with a **512-bit datapath**, **16 parallel ALU lanes**, 4-warp round-robin scheduling, a per-warp scoreboard, and an 8-bit byte-multiplexed host interface — built to explore how real GPU parallelism works from the ground up.
 
-Implemented in Verilog with full architectural documentation, a clean ISA, working SIMD kernels, and a deterministic 1-cycle DPRAM memory model (no cache complexity).
+Implemented in Verilog and taped out on the **SCL 180nm** process (`C2S0284`), with a 1024 × 32 dual-port SRAM, a synthesizable pad ring, and a fully deterministic 1-cycle DPRAM memory model.
 
 ---
 
@@ -10,20 +10,25 @@ Implemented in Verilog with full architectural documentation, a clean ISA, worki
 
 - [Overview](#overview)
 - [Architecture](#architecture)
-  - [GPU Top Level](#gpu-top-level)
-  - [Device Control Register](#device-control-register)
-  - [Dispatcher](#dispatcher)
-  - [Compute Cores](#compute-cores)
+  - [Chip Top Level](#chip-top-level)
+  - [GPU Module](#gpu-module)
+  - [Compute Core](#compute-core)
   - [SIMD Wrapper](#simd-wrapper)
-  - [Memory Controllers](#memory-controllers)
+  - [Register Files](#register-files)
+  - [Scoreboard](#scoreboard)
+  - [Reset Synchronizer](#reset-synchronizer)
+  - [Shared Memory](#shared-memory)
 - [Global Memory](#global-memory)
   - [Dual-Port SRAM Macro](#dual-port-sram-macro)
   - [Port A — Instruction Fetch](#port-a--instruction-fetch)
   - [Port B — Data Load/Store](#port-b--data-loadstore)
+- [Host Interface](#host-interface)
 - [ISA](#isa)
 - [Execution Model](#execution-model)
-  - [Warp Dispatch](#warp-dispatch)
+  - [Warp Scheduling](#warp-scheduling)
   - [SIMD Lane Execution](#simd-lane-execution)
+  - [Memory Lane Sequencing](#memory-lane-sequencing)
+- [Scoreboard & Hazard Detection](#scoreboard--hazard-detection)
 - [Kernels](#kernels)
   - [Vector Addition](#vector-addition)
   - [Parallel Dot Product](#parallel-dot-product)
@@ -43,14 +48,17 @@ This project cuts through that by building a real, minimal GPU in Verilog with o
 
 | Feature | This GPU | Naive tiny GPU |
 |---|---|---|
-| Datapath width | **128-bit (4 × 32-bit SIMD)** | 8–16 bit scalar |
-| ALUs | **4 × 32-bit in parallel** | 1 per thread |
+| Datapath width | **512-bit (16 × 32-bit SIMD)** | 8–16-bit scalar |
+| ALU lanes | **16 × 32-bit in parallel** | 1 per thread |
 | Memory | **1024 × 32 Dual-Port SRAM** | Small single-port SRAM |
 | Instruction width | **32-bit** | 16-bit |
 | Address bus | **10-bit (1024 addresses)** | 8-bit |
+| Warps | **4 warps, round-robin scheduled** | Single thread |
+| Hazard detection | **Per-warp scoreboard (RAW stalls)** | None |
+| Lane masking | **16-bit per-lane execution mask** | N/A |
 | Cache | **Removed — deterministic 1-cycle latency** | Optional cache |
-| Dispatch | **Warp FSM with pc[0:3] register array** | Round-robin |
-| Process | **SCL 180nm** | Simulation only |
+| Host interface | **8-bit byte-multiplexed, 4-byte assembled** | Simple parallel bus |
+| Process | **SCL 180nm (taped out as C2S0284)** | Simulation only |
 
 The core design philosophy: **no cache, no ambiguity.** By targeting a synchronous DPRAM with a guaranteed 1-cycle read latency, every memory access is fully deterministic. This makes the architecture far easier to reason about and simulate.
 
@@ -58,151 +66,207 @@ The core design philosophy: **no cache, no ambiguity.** By targeting a synchrono
 
 ## Architecture
 
-![GPU Architecture](docs/images/gpu_architecture.png)
+### Chip Top Level (`C2S0284`)
 
-### GPU Top Level
-
-The GPU is organized as a hierarchy:
+The physical chip module wraps the GPU and SRAM with SCL 180nm pad cells and implements the host-facing byte-multiplexed interface.
 
 ```
-GPU
-├── Device Control Register   (start · reset · status flags)
-├── Dispatcher                (warp_id mux · FSM · pc[0:3] array)
-├── Compute Core 0            (regfile[0] · simd_a[31:0]   · pc[0])
-├── Compute Core 1            (regfile[1] · simd_a[63:32]  · pc[1])
-├── Compute Core 2            (regfile[2] · simd_a[95:64]  · pc[2])
-├── Compute Core 3            (regfile[3] · simd_a[127:96] · pc[3])
-├── SIMD Wrapper              (128-bit datapath · 4× ALU · rf_wd[0:3])
-├── Program Memory Controller (FETCH FSM → Port A, Read-Only)
-└── Data Memory Controller    (LOAD/STORE → Port B, Read/Write)
+C2S0284 (chip_top)
+├── SCL Pad Ring
+│   ├── pc3c01  — clock input pad + buffer
+│   ├── pc3d01  — digital input pads (rst_n, start, host_data_in[7:0], host_addr[9:0], ...)
+│   └── pc3o05  — output drive pads (done, host_data_out[7:0], host_ack)
+│
+├── Host Byte-Multiplexed Write Path
+│   ├── write_buffer[23:0]     — accumulates bytes 0–2 on rising edges
+│   └── full_host_word[31:0]   — assembled on byte_sel == 2'b11 (byte 3 arrives)
+│
+├── Port B Arbitration
+│   ├── start == 0  →  host controls Port B (load program/data)
+│   └── start == 1  →  GPU controls Port B (kernel execution)
+│
+├── shared_mem (rd3_1024x32)   — 1-cycle DPRAM macro
+└── gpu                        — compute engine
 ```
 
-All four compute cores share a single **SIMD wrapper** that bundles their register operands into a 128-bit bus, executes four 32-bit ALU operations in parallel, and unpacks results back to individual register files.
+**Key chip-level signals:**
 
----
-
-### Device Control Register
-
-The device control register is the host-facing interface to the GPU. It exposes three signals:
-
-| Signal | Direction | Description |
-|---|---|---|
-| `start` | Input | Assert high to begin kernel execution |
-| `reset` | Input | Synchronous reset — clears all state |
-| `status_flags` | Output | Reflects current execution state (idle / running / done / error) |
-
-The host loads program memory and data memory before asserting `start`. Once asserted, control transfers entirely to the dispatcher.
-
----
-
-### Dispatcher
-
-The dispatcher is the central FSM that manages warp scheduling across all four compute cores.
-
-**Internal signals:**
-
-| Signal | Description |
-|---|---|
-| `warp_id mux` | Selects the active warp being dispatched |
-| `FSM controller` | State machine controlling fetch → decode → execute flow |
-| `pc[0:3]` register array | Independent program counters for each of the 4 cores |
-
-**Dispatch flow:**
-
-1. On `start`, the FSM moves from `IDLE` → `DISPATCH`.
-2. The dispatcher issues warp assignments to each compute core, driving the appropriate `pc[N]` to the program memory controller.
-3. After all warps complete (all cores assert `done`), the FSM transitions to `DONE` and sets the status flag.
-
-The `pc[0:3]` register array means each core maintains an **independent program counter** — critical for correct multi-warp execution where different warps may be at different instruction offsets.
-
----
-
-### Compute Cores
-
-There are **4 compute cores** (Core 0–3), each operating on its own 32-bit slice of the 128-bit SIMD datapath.
-
-| Core | Register File | SIMD Lane | Program Counter |
+| Signal | Width | Direction | Description |
 |---|---|---|---|
-| Core 0 | `regfile[0]` | `simd_a[31:0]` | `pc[0]` |
-| Core 1 | `regfile[1]` | `simd_a[63:32]` | `pc[1]` |
-| Core 2 | `regfile[2]` | `simd_a[95:64]` | `pc[2]` |
-| Core 3 | `regfile[3]` | `simd_a[127:96]` | `pc[3]` |
+| `clk_pad` | 1 | Input | External clock (through `pc3c01` clock pad) |
+| `rst_n_pad` | 1 | Input | Active-low reset |
+| `start_pad` | 1 | Input | Assert to begin kernel execution |
+| `done_pad` | 1 | Output | Asserted when kernel completes |
+| `host_data_in_pad` | 8 | Input | Byte-multiplexed write data |
+| `host_data_out_pad` | 8 | Output | Byte-multiplexed read data |
+| `host_addr_pad` | 10 | Input | SRAM word address |
+| `host_we_pad` | 1 | Input | Write enable |
+| `host_byte_sel_pad` | 2 | Input | Byte lane selector (`00`–`11`) |
+| `host_req_pad` | 1 | Input | Request strobe |
+| `host_ack_pad` | 1 | Output | Acknowledge (1-cycle delayed) |
 
-Each core:
-- Reads operands from its dedicated `regfile[N]`
-- Contributes its 32-bit operand slice to the SIMD pack bus (`simd_a`)
-- Receives its result slice from the SIMD unpack bus (`rf_wd[N]`)
+---
 
-Cores do **not** contain their own ALUs — computation happens centrally in the SIMD wrapper, keeping the per-core logic lean.
+### GPU Module
+
+The `gpu` module is a thin wrapper that instantiates the reset synchronizer and the single compute core.
+
+```
+gpu
+├── reset_sync     — 2-FF synchronizer (rst_n → rst)
+└── compute_core   — all execution logic
+```
+
+External memory ports are passed through directly to `compute_core`. The `cfg[5:0]` input is reserved for future configuration.
+
+---
+
+### Compute Core
+
+The compute core is the heart of the GPU. It implements a **4-warp FSM** with a **16-lane SIMD datapath** and handles all instruction fetch, decode, execute, and memory access.
+
+```
+compute_core
+├── pc[0:3]          — independent 10-bit program counters, one per warp
+├── warp_id          — 2-bit active warp selector (round-robin)
+├── instr_addr       — pc[warp_id] driven to Port A
+│
+├── Instruction Decode
+│   ├── opcode[31:24]
+│   ├── rd[23:20]
+│   ├── rs1[19:16]
+│   ├── rs2[15:12]
+│   └── addr[9:0]
+│
+├── 16× regfile      — one per SIMD lane (16 × 32-bit registers each)
+├── simd_a[511:0]    — packed operand A (16 × 32-bit)
+├── simd_b[511:0]    — packed operand B (16 × 32-bit)
+├── simd_wrapper     — 16× parallel 32-bit ALU with lane masking
+├── simd_out[511:0]  — packed ALU results
+├── rf_wd[0:15]      — writeback data per lane (ALU result or load data)
+├── rf_we_bus[15:0]  — per-lane write enable (one-hot during LOAD sequencing)
+│
+├── scoreboard       — per-warp RAW hazard detection
+└── lane_ctr[3:0]    — sequencing counter for LOAD/STORE (0–15)
+```
+
+**FSM states:**
+
+| State | Description |
+|---|---|
+| `IDLE` | Waiting for `start` assertion |
+| `WAIT_FETCH` | Latching `instr_data` from SRAM Port A (1-cycle latency) |
+| `EXECUTE` | Decode and dispatch; stall if scoreboard signals RAW hazard |
+| `WAIT_MEM_LOAD` | Sequences 16 consecutive memory reads, one per lane |
+| `WAIT_MEM_STORE` | Sequences 16 consecutive memory writes, one per lane |
+
+After each instruction (ADD, LOAD, STORE), `warp_id` increments (mod 4), and the next warp's `pc` drives the next fetch. This round-robin interleaving hides memory latency across warps.
 
 ---
 
 ### SIMD Wrapper
 
-The SIMD wrapper is the computational heart of the GPU. It implements a **128-bit wide datapath** by running **4 × 32-bit ALUs in parallel.**
+The SIMD wrapper implements a **512-bit wide execution datapath** across **16 parallel 32-bit ALUs.**
 
 ```
-Core 0 → simd_a[31:0]   ─┐
-Core 1 → simd_a[63:32]  ─┤  PACK  →  [128-bit simd_a bus]
-Core 2 → simd_a[95:64]  ─┤             ↓
-Core 3 → simd_a[127:96] ─┘       4 × 32-bit ALUs
+Lane 0  → simd_a[31:0]    ─┐
+Lane 1  → simd_a[63:32]   ─┤
+...                        ─┤  PACK  →  [512-bit simd_a bus]
+Lane 15 → simd_a[511:480] ─┘             ↓
+                                    16 × 32-bit ALUs
+                                    (masked per lane)
                                          ↓
-Core 0 ← rf_wd[0]       ─┐  UNPACK ←  [128-bit simd_out bus]
-Core 1 ← rf_wd[1]       ─┤
-Core 2 ← rf_wd[2]       ─┤
-Core 3 ← rf_wd[3]       ─┘
+Lane 0  ← rf_wd[0]        ─┐  UNPACK ←  [512-bit simd_out bus]
+Lane 1  ← rf_wd[1]        ─┤
+...                        ─┤
+Lane 15 ← rf_wd[15]       ─┘
 ```
 
 **Key signals:**
 
 | Signal | Width | Description |
 |---|---|---|
-| `simd_a[127:0]` | 128-bit | Packed operand A from all 4 cores |
-| `simd_b[127:0]` | 128-bit | Packed operand B from all 4 cores |
-| `simd_out[127:0]` | 128-bit | Packed ALU results |
-| `rf_wd[0:3]` | 4 × 32-bit | Unpacked writeback data per core |
+| `a[511:0]` | 512-bit | Packed operand A from all 16 lanes |
+| `b[511:0]` | 512-bit | Packed operand B from all 16 lanes |
+| `opcode[2:0]` | 3-bit | ALU operation (shared across all lanes) |
+| `mask[15:0]` | 16-bit | Per-lane execution mask; masked lanes output `0` |
+| `result[511:0]` | 512-bit | Packed ALU results |
 
-This design achieves **true data-level parallelism (DLP):** a single instruction dispatched to the SIMD wrapper triggers four simultaneous 32-bit operations — one per lane.
+The mask is currently driven as `16'hFFFF` (all lanes active). Masked-off lanes substitute `0` for both operands before the ALU, producing a zero result without requiring special ALU handling.
 
 ---
 
-### Memory Controllers
+### Register Files
 
-Two dedicated controllers handle the split memory interface:
+Each of the 16 SIMD lanes has its own dedicated **regfile**: 16 × 32-bit registers (`R0`–`R15`), synchronously reset to zero.
 
-#### Program Memory Controller
+| Property | Value |
+|---|---|
+| Registers per lane | 16 × 32-bit |
+| Lanes | 16 |
+| Total register storage | 256 × 32-bit (8 KB) |
+| Write policy | Synchronous, write-enable gated |
+| Read policy | Asynchronous (combinational) |
 
-- **Purpose:** Fetches the 32-bit instruction word at `pc[N]` each cycle.
-- **Interface:** Port A of the dual-port SRAM (Read-Only).
-- **Signals:** `mem_addr` (10-bit), `mem_req` (request strobe), `FETCH FSM` (internal state machine managing multi-cycle fetch if needed).
-- Since Port A is read-only and the SRAM has 1-cycle latency, instruction fetch is **fully deterministic** with no stall cycles under normal operation.
+All 16 regfiles receive the same `rs1`, `rs2`, and `rd` selectors — the SIMD model means all lanes execute the same instruction on their own private data.
 
-#### Data Memory Controller
+---
 
-- **Purpose:** Services LOAD and STORE instructions from all cores.
-- **Interface:** Port B of the dual-port SRAM (Read/Write).
-- **Signals:** `mem_we` (write enable), `tri-state buf` (bidirectional data bus control), `LOAD/STORE` (operation type).
-- **Broadcast LOAD:** A single LOAD address can broadcast the same 32-bit value to all 4 SIMD lanes simultaneously — critical for loading shared constants (e.g., a stride value used by all threads).
+### Scoreboard
+
+The scoreboard tracks **RAW (read-after-write) hazards** independently per warp.
+
+```
+scoreboard
+├── busy[0:3][15:0]   — 16-bit busy vector per warp (one bit per register)
+├── stall             — asserted if rs1 or rs2 is busy for the active warp
+├── set_busy          — mark rd as busy on a LOAD dispatch
+└── clear_busy        — clear rd busy bit when LOAD completes (lane_ctr == 15)
+```
+
+The scoreboard fires a stall when a warp tries to use a register that is still being loaded. Since LOAD takes 16 cycles (one per lane), without the scoreboard a dependent instruction would read stale data. The stall holds the FSM in `EXECUTE` until the register is free.
+
+---
+
+### Reset Synchronizer
+
+A standard 2-flip-flop synchronizer converts the asynchronous active-low `rst_n` pad to a synchronous active-high `rst` for all internal logic.
+
+```
+rst_n (async, active-low)
+  → FF1 (clk) → FF2 (clk) → rst (sync, active-high)
+```
+
+---
+
+### Shared Memory
+
+`shared_mem` is a thin wrapper that maps the GPU's logical Port A / Port B interface onto the SCL 180nm `rd3_1024x32` DPRAM macro's active-low control signals.
+
+| Port | Macro Port | Access | Consumer |
+|---|---|---|---|
+| Port A | Port 1 | Read-only (`WEB1` tied high) | Instruction fetch |
+| Port B | Port 2 | Read/Write | Data load/store + host preload |
 
 ---
 
 ## Global Memory
 
-### Dual-Port SRAM Macro (1024 × 32)
+### Dual-Port SRAM Macro (`rd3_1024x32`)
 
-The GPU's only memory is a **1024 × 32-bit synchronous dual-port SRAM macro**, fabricated at **SCL 180nm.**
+The GPU's only memory is a **1024 × 32-bit synchronous dual-port SRAM macro** from the SCL 180nm PDK.
 
 ```
-┌─────────────────────────────────────────┐
-│         Dual-Port SRAM (1024×32)        │
-│                                         │
-│  Port A (Read-Only)  │  Port B (R/W)    │
-│  ─────────────────── │ ──────────────── │
-│  Instruction Fetch   │ Data Load/Store  │
-│  10-bit addr bus     │ 10-bit addr      │
-│  32-bit instr out    │ 32-bit data bus  │
-│  SCL 180nm           │ Broadcast → lanes│
-└─────────────────────────────────────────┘
+┌────────────────────────────────────────────┐
+│        Dual-Port SRAM (1024 × 32)          │
+│                                            │
+│  Port A (Read-Only)  │  Port B (R/W)       │
+│  ────────────────── │ ────────────────── │
+│  Instruction Fetch  │ Data Load/Store    │
+│  10-bit addr         │ 10-bit addr        │
+│  32-bit instr out    │ 32-bit data bus    │
+│  SCL 180nm           │ Host preload too   │
+└────────────────────────────────────────────┘
 ```
 
 > **Note on cache removal:** A cache layer was deliberately removed from this design. The SCL 180nm DPRAM macro guarantees **1-cycle synchronous read latency**, making cache unnecessary and removing a major source of timing unpredictability. This simplifies verification substantially and keeps the critical path clean.
@@ -215,7 +279,7 @@ The GPU's only memory is a **1024 × 32-bit synchronous dual-port SRAM macro**, 
 | Address bus | 10-bit (1024 addressable words) |
 | Data out | 32-bit instruction word |
 | Latency | 1 cycle (synchronous) |
-| Consumer | Program Memory Controller → FETCH FSM |
+| Consumer | `WAIT_FETCH` state → `instr` register |
 
 ### Port B — Data Load/Store
 
@@ -223,79 +287,136 @@ The GPU's only memory is a **1024 × 32-bit synchronous dual-port SRAM macro**, 
 |---|---|
 | Access type | Read / Write |
 | Address bus | 10-bit |
-| Data bus | 32-bit bidirectional |
+| Data bus | 32-bit |
 | Latency | 1 cycle (synchronous) |
-| Broadcast | Single LOAD → all 4 SIMD lanes |
-| Consumer | Data Memory Controller · Host |
+| Lane sequencing | 16 consecutive cycles per LOAD or STORE |
+| Consumer | `WAIT_MEM_LOAD` / `WAIT_MEM_STORE` states + host preload |
 
-Port B is shared between **kernel data access** and **host access** (loading initial data into memory before kernel launch). Arbitration between host and GPU accesses is managed by the data memory controller's tri-state buffer logic.
+---
+
+## Host Interface
+
+The host loads program and data into the SRAM before asserting `start`. Because the physical pads are 8-bit, a 32-bit word is assembled from four byte-lane writes:
+
+```
+host_byte_sel = 2'b00  →  write_buffer[7:0]   ← host_data_in
+host_byte_sel = 2'b01  →  write_buffer[15:8]  ← host_data_in
+host_byte_sel = 2'b10  →  write_buffer[23:16] ← host_data_in
+host_byte_sel = 2'b11  →  full_host_word assembled; SRAM write fires
+```
+
+`host_ack` is returned 1 cycle after `host_req` (registered). While `start` is asserted, Port B is fully owned by the GPU and host writes are ignored.
 
 ---
 
 ## ISA
 
-The GPU implements a **32-bit fixed-width instruction set** designed for SIMD data-parallel kernels.
+The GPU implements a **32-bit fixed-width instruction set.**
 
-| Instruction | Format | Description |
-|---|---|---|
-| `ADD Rd, Ra, Rb` | Arithmetic | `Rd = Ra + Rb` across all 4 lanes |
-| `SUB Rd, Ra, Rb` | Arithmetic | `Rd = Ra - Rb` across all 4 lanes |
-| `MUL Rd, Ra, Rb` | Arithmetic | `Rd = Ra * Rb` across all 4 lanes |
-| `DIV Rd, Ra, Rb` | Arithmetic | `Rd = Ra / Rb` across all 4 lanes |
-| `LDR Rd, addr` | Memory | Load 32-bit word from data memory into `Rd` (broadcast capable) |
-| `STR addr, Rs` | Memory | Store `Rs` to data memory |
-| `CONST Rd, #imm` | Immediate | Load 16-bit sign-extended immediate into `Rd` |
-| `CMP Ra, Rb` | Compare | Set NZP flags based on `Ra - Rb` |
-| `BRnzp label` | Branch | Branch to `label` if NZP matches condition |
-| `RET` | Control | End of kernel; signal core done |
+| Instruction | Opcode | Format | Description |
+|---|---|---|---|
+| `LOAD Rd, addr` | `0x01` | Memory | Load from `addr`; sequences 16 reads (one per lane) |
+| `STORE addr, Rs` | `0x02` | Memory | Store to `addr`; sequences 16 writes (one per lane) |
+| `ADD Rd, Rs1, Rs2` | `0x03` | Arithmetic | `Rd = Rs1 + Rs2` across all 16 lanes simultaneously |
+| `HALT` | `0xFF` | Control | End of kernel; assert `done`, return to `IDLE` |
 
-**Register file:** Each core has 16 × 32-bit registers (`R0`–`R15`). Registers `R13`–`R15` are read-only and carry the SIMD-lane metadata:
+**Instruction encoding (32-bit):**
 
-| Register | Contents |
+| Bits | Field |
 |---|---|
-| `R13` | `lane_id` — which of the 4 lanes this core represents (0–3) |
-| `R14` | `warp_id` — current warp being executed |
-| `R15` | `total_lanes` — total number of active SIMD lanes |
+| `[31:24]` | Opcode |
+| `[23:20]` | Destination register `Rd` |
+| `[19:16]` | Source register `Rs1` |
+| `[15:12]` | Source register `Rs2` |
+| `[9:0]` | Memory address (LOAD/STORE) |
+
+**ALU operations** (selected by `simd_wrapper`'s 3-bit `opcode`):
+
+| opcode | Operation |
+|---|---|
+| `3'b000` | ADD |
+| `3'b001` | SUB |
+| `3'b010` | AND |
+| `3'b011` | OR |
+| `3'b100` | XOR |
+
+**Register file:** Each lane has 16 × 32-bit registers (`R0`–`R15`), all synchronously reset to zero.
 
 ---
 
 ## Execution Model
 
-### Warp Dispatch
+### Warp Scheduling
 
 ```
 Host: assert start
   │
   ▼
-Dispatcher FSM: IDLE → DISPATCH
+Compute Core FSM: IDLE → WAIT_FETCH
   │
-  ├── Assign warp 0 → all 4 cores (lanes 0–3)
-  │     pc[0], pc[1], pc[2], pc[3] all initialized
+  ├── Fetch instruction at pc[warp_id]  (1 cycle, Port A)
   │
-  ├── Cores execute in lock-step (same PC per warp)
-  │     FETCH → DECODE → EXECUTE → WRITEBACK
+  ├── EXECUTE:
+  │   ├── ADD?   → all 16 ALUs fire in parallel
+  │   │            rf_we_bus = 16'hFFFF (all lanes write)
+  │   │            pc[warp_id]++, warp_id = (warp_id + 1) % 4
+  │   │
+  │   ├── LOAD?  → 16-cycle sequencing loop (WAIT_MEM_LOAD)
+  │   │            each cycle: one lane's regfile written via rf_we_bus one-hot
+  │   │            pc[warp_id]++, warp_id advances after last lane
+  │   │
+  │   ├── STORE? → 16-cycle sequencing loop (WAIT_MEM_STORE)
+  │   │            each cycle: mem_data_out = lane_rd1[lane_ctr], mem_we = 1
+  │   │            pc[warp_id]++, warp_id advances after last lane
+  │   │
+  │   └── HALT?  → done = 1, return to IDLE
   │
-  ├── On RET: core asserts done
-  │
-  ├── Dispatcher waits for all 4 done signals
-  │
-  └── FSM → DONE; set status_flag[done]
+  └── warp_id round-robins: 0 → 1 → 2 → 3 → 0 → ...
 ```
 
-Because all 4 cores share the same `warp_id` and execute the same instruction stream, they diverge only in their **lane-specific data** (operands from their individual `regfile[N]`). This is the SIMD execution model in hardware.
+Each warp has an independent `pc[N]` so warps can be at different instruction offsets simultaneously. Warp interleaving hides the 16-cycle memory latency — while one warp sequences a LOAD, other warps can be executing ADD instructions.
 
 ### SIMD Lane Execution
 
-Each instruction cycle:
+Each ADD instruction cycle:
 
-1. **FETCH** — Program memory controller drives `mem_addr = pc[active_warp]` to Port A. SRAM returns 32-bit instruction in 1 cycle.
-2. **DECODE** — Instruction decoded into ALU opcode, source/destination registers, and memory control signals.
-3. **PACK** — Each core reads its source registers. SIMD wrapper packs `simd_a[127:0]` and `simd_b[127:0]`.
-4. **EXECUTE** — 4 × 32-bit ALUs compute results in parallel.
-5. **UNPACK** — `simd_out[127:0]` unpacked into `rf_wd[0:3]`, written back to each core's `regfile[N]`.
-6. **PC UPDATE** — All `pc[N]` increment together (or branch per NZP result).
+1. **FETCH** — `instr_addr = pc[warp_id]`; SRAM Port A returns 32-bit instruction in 1 cycle (`WAIT_FETCH`).
+2. **DECODE** — opcode, `rd`, `rs1`, `rs2` extracted from `instr`.
+3. **PACK** — All 16 regfiles read `rs1` and `rs2`; SIMD wrapper receives `simd_a[511:0]` and `simd_b[511:0]`.
+4. **EXECUTE** — 16 × 32-bit ALUs compute results in parallel, producing `simd_out[511:0]`.
+5. **WRITEBACK** — `rf_we_bus = 16'hFFFF`; all 16 lanes write `simd_out[lane*32+31 : lane*32]` into `rd`.
+6. **PC UPDATE** — `pc[warp_id]++`; `warp_id` increments to schedule the next warp.
 
-Memory instructions (LDR/STR) stall the pipeline for 1 cycle while the data memory controller accesses Port B.
+### Memory Lane Sequencing
+
+LOAD and STORE do not broadcast a single word to all lanes. Instead, they **sequence across all 16 lanes** using `lane_ctr`:
+
+**LOAD** (`WAIT_MEM_LOAD`): Each cycle, `mem_addr = base_addr + lane_ctr` and `rf_we_bus = 1 << lane_ctr`. One lane's register is written per cycle. After 16 cycles, all lanes have loaded their respective words.
+
+**STORE** (`WAIT_MEM_STORE`): Each cycle, `mem_data_out = lane_rd1[lane_ctr]` and `mem_we = 1`. One lane's data is written to `base_addr + lane_ctr` per cycle. After 16 cycles, all 16 words are stored.
+
+---
+
+## Scoreboard & Hazard Detection
+
+The scoreboard prevents **RAW hazards** where a LOAD destination register is read before the load completes.
+
+```
+scoreboard
+  busy[warp][reg] = 1   →  register is being loaded
+  stall = busy[warp][rs1] | busy[warp][rs2]
+
+  On LOAD dispatch:       busy[warp][rd] ← 1
+  On LOAD completion:     busy[warp][rd] ← 0   (when lane_ctr == 15)
+```
+
+Hazard example:
+```
+LOAD  R3, 0x100    ; starts 16-cycle memory sequence; scoreboard marks R3 busy
+ADD   R5, R3, R4   ; stalls in EXECUTE until R3 is cleared (all 16 lanes loaded)
+```
+
+The scoreboard maintains 4 independent 16-bit busy vectors — one per warp — so stalls on one warp do not affect others.
 
 ---
 
@@ -303,62 +424,42 @@ Memory instructions (LDR/STR) stall the pipeline for 1 cycle while the data memo
 
 ### Vector Addition
 
-Adds two length-4 vectors in a single warp dispatch (all 4 lanes active).
+Adds two length-16 vectors, one element per SIMD lane.
 
 ```asm
 ; vector_add.asm
-; A[4] + B[4] -> C[4], one element per lane
+; A[16] + B[16] -> C[16], one element per lane
 
-CONST R0, #0          ; base address of A
-CONST R1, #4          ; base address of B
-CONST R2, #8          ; base address of C
-
-ADD   R3, R0, %lane_id   ; addr(A[lane]) = baseA + lane_id
-LDR   R3, R3             ; load A[lane]
-
-ADD   R4, R1, %lane_id   ; addr(B[lane]) = baseB + lane_id
-LDR   R4, R4             ; load B[lane]
-
-ADD   R5, R3, R4         ; C[lane] = A[lane] + B[lane]
-
-ADD   R6, R2, %lane_id   ; addr(C[lane]) = baseC + lane_id
-STR   R6, R5             ; store C[lane]
-
-RET
+LOAD  R0, 0x000    ; load A[0..15] → R0 across all 16 lanes
+LOAD  R1, 0x010    ; load B[0..15] → R1 across all 16 lanes
+ADD   R2, R0, R1   ; C[lane] = A[lane] + B[lane], 16 additions in parallel
+STORE 0x020, R2    ; store C[0..15] from R2 across all 16 lanes
+HALT
 ```
 
-All four additions happen in parallel across the SIMD lanes on the single `ADD R5, R3, R4` instruction.
+The single `ADD R2, R0, R1` instruction triggers 16 simultaneous 32-bit additions across the 512-bit SIMD datapath.
 
 ---
 
 ### Parallel Dot Product
 
-Computes a dot product of two length-4 vectors using SIMD multiply-accumulate, then reduces.
+Computes element-wise products; host reduces the 16 partial products.
 
 ```asm
 ; dot_product.asm
-; result = sum(A[i] * B[i]) for i in 0..3
+; partial[i] = A[i] * B[i] for i in 0..15
 
-CONST R0, #0          ; base address of A
-CONST R1, #4          ; base address of B
+; Note: MUL is not in the current ALU ISA.
+; The pattern below uses the ADD opcode as a placeholder.
 
-ADD   R2, R0, %lane_id
-LDR   R2, R2          ; load A[lane]
-
-ADD   R3, R1, %lane_id
-LDR   R3, R3          ; load B[lane]
-
-MUL   R4, R2, R3      ; partial[lane] = A[lane] * B[lane]
-
-; Store partial products for host-side reduction
-CONST R5, #8
-ADD   R5, R5, %lane_id
-STR   R5, R4
-
-RET
+LOAD  R0, 0x000    ; load A[0..15] → R0
+LOAD  R1, 0x010    ; load B[0..15] → R1
+ADD   R2, R0, R1   ; partial sums (replace with MUL when extended)
+STORE 0x020, R2    ; store 16 partial products for host reduction
+HALT
 ```
 
-The four multiply operations (`MUL R4, R2, R3`) execute simultaneously across the 128-bit SIMD datapath.
+> **Note:** The current ALU supports ADD, SUB, AND, OR, XOR. MUL is a planned extension (see Next Steps).
 
 ---
 
@@ -374,7 +475,7 @@ sudo apt install iverilog          # Ubuntu
 # Python cocotb testbench framework
 pip install cocotb
 
-# SystemVerilog → Verilog converter
+# SystemVerilog → Verilog converter (if needed)
 # Download sv2v from https://github.com/zachjs/sv2v/releases
 # Add binary to $PATH
 ```
@@ -389,7 +490,7 @@ make test_dotprod      # Run dot product kernel
 
 Simulation outputs a log in `test/logs/` with:
 - Initial SRAM data memory state
-- Cycle-by-cycle execution trace (all 4 lanes, all signals)
+- Cycle-by-cycle execution trace (all 16 lanes, all signals)
 - Final SRAM data memory state
 
 ### Execution Trace Format
@@ -397,44 +498,59 @@ Simulation outputs a log in `test/logs/` with:
 Each cycle of the trace shows:
 
 ```
-Cycle 12  WARP:0  PC:5  INSTR: MUL R4, R2, R3
-  Lane 0: R2=0x00000003  R3=0x00000007  →  R4=0x00000015
-  Lane 1: R2=0x00000005  R3=0x00000002  →  R4=0x0000000A
-  Lane 2: R2=0x00000001  R3=0x00000009  →  R4=0x00000009
-  Lane 3: R2=0x00000008  R3=0x00000004  →  R4=0x00000020
+Cycle 8   WARP:0  PC:2  INSTR: ADD R2, R0, R1
+  Lane  0: R0=0x00000003  R1=0x00000007  →  R2=0x0000000A
+  Lane  1: R0=0x00000005  R1=0x00000002  →  R2=0x00000007
+  Lane  2: R0=0x00000001  R1=0x00000009  →  R2=0x0000000A
+  Lane  3: R0=0x00000008  R1=0x00000004  →  R2=0x0000000C
+  ...
+  Lane 15: R0=0x00000006  R1=0x00000003  →  R2=0x00000009
 ```
 
 ---
 
 ## Design Decisions
 
+### Single compute core with 16 internal lanes, not 16 separate cores
+
+The 16-way parallelism lives inside `compute_core` as a `generate` loop over 16 `regfile` instances and 16 ALU lanes in the `simd_wrapper`. A single instruction decoder, single FSM, and single scoreboard serve all 16 lanes. This is faithful to how a real GPU SM (Streaming Multiprocessor) works: one instruction stream, many data lanes.
+
 ### Why no cache?
 
-The SCL 180nm DPRAM macro used for global memory guarantees a **1-cycle synchronous read latency.** Adding a cache would introduce timing variability, tag-matching logic, eviction policy complexity, and coherence concerns — none of which aid understanding at this stage. Removing it keeps the memory subsystem fully deterministic and the critical path predictable.
+The SCL 180nm DPRAM macro guarantees a **1-cycle synchronous read latency.** Adding a cache would introduce timing variability, tag-matching logic, eviction policy complexity, and coherence concerns — none of which aid understanding at this stage. Removing it keeps the memory subsystem fully deterministic and the critical path predictable.
+
+### Why sequential LOAD/STORE over 16 cycles?
+
+The shared SRAM Port B is 32-bit wide — there is only one physical memory port. Servicing all 16 lanes in a single cycle would require a 512-bit-wide memory bus. Instead, `lane_ctr` sequences 16 consecutive single-word accesses. Future work could explore a banked memory scheme to reduce this to fewer cycles.
+
+### Why 4 warps?
+
+The `pc[0:3]` array and 2-bit `warp_id` allow 4 independent instruction streams to interleave. This directly hides the 16-cycle LOAD/STORE latency: while one warp sequences a memory operation, the other 3 warps can each execute an ADD in the intervening cycles. Scaling to 8 warps would require a 3-bit `warp_id` and a wider scoreboard.
+
+### Why round-robin warp scheduling?
+
+Round-robin is the simplest correct scheduler and easy to reason about. Each instruction (including a 16-cycle LOAD) advances `warp_id` exactly once at completion, so all warps make progress at the same rate assuming balanced kernels. A priority scheduler or occupancy-aware scheduler is a straightforward next step.
+
+### Why an 8-bit byte-multiplexed host interface?
+
+Minimizing pad count is critical at SCL 180nm. A 32-bit parallel host bus would consume 32 input pads for data alone. The byte-mux scheme needs only 8 data pads at the cost of 4 write cycles per word — acceptable for the one-time program/data load before kernel launch.
 
 ### Why 32-bit instructions?
 
-A 32-bit instruction word provides enough opcode space for the full ALU set, a 16-bit immediate field, and 4-bit source/destination register selectors — without encoding tricks. The 10-bit address bus (1024 words of program memory) also maps cleanly to a 32-bit instruction layout.
-
-### Why 4 cores / 128-bit datapath?
-
-4 lanes gives a meaningful demonstration of SIMD data-level parallelism — enough to run real vector kernels — while keeping the register-file, pack/unpack, and writeback logic simple enough to read in a single sitting. Scaling to 8 or 16 lanes is a straightforward extension.
-
-### Why dual-port SRAM?
-
-Separating instruction fetch (Port A) from data load/store (Port B) eliminates structural hazards entirely. No arbitration is needed between the program counter logic and the data memory controller — they never contend for the same port.
+A 32-bit instruction word provides enough opcode space (8-bit opcode field) for the full ALU set, a 10-bit address field for full SRAM coverage, and 4-bit source/destination register selectors — without encoding tricks.
 
 ---
 
 ## Next Steps
 
-- [ ] Add branch divergence tracking (per-lane NZP + predication mask)
-- [ ] Implement a multi-warp scheduler (round-robin across warps while one warp is in LDR stall)
-- [ ] Write a simple assembler in Python that targets this ISA
-- [ ] Add memory coalescing for sequential SIMD store patterns
-- [ ] Explore Tiny Tapeout integration for physical fabrication at SCL 180nm
+- [ ] Add MUL and DIV to the ALU (extend `opcode` to support 5 additional operations)
+- [ ] Implement per-lane NZP flags and predication mask for branch divergence
+- [ ] Build a multi-bank memory system to reduce LOAD/STORE from 16 cycles to fewer
+- [ ] Write a Python assembler targeting this ISA
+- [ ] Extend warp count from 4 to 8 (3-bit `warp_id`, wider scoreboard)
+- [ ] Add VCD waveform dump support for GTKWave visualization
 - [ ] Add a matrix multiply kernel as a 2D warp grid proof-of-concept
-- [ ] Generate waveform dumps (VCD) for GTKWave visualization
+- [ ] Explore a second compute core to demonstrate multi-core scaling
 
 ---
 
@@ -443,17 +559,19 @@ Separating instruction fetch (Port A) from data load/store (Port B) eliminates s
 ```
 simd-gpu/
 ├── src/
-│   ├── gpu.sv                  # Top-level GPU module
-│   ├── device_control_reg.sv   # Host interface: start/reset/status
-│   ├── dispatcher.sv           # Warp FSM + pc[0:3] register array
-│   ├── compute_core.sv         # Single SIMD lane: regfile + PC
-│   ├── simd_wrapper.sv         # 128-bit datapath: 4× ALU, pack/unpack
-│   ├── prog_mem_ctrl.sv        # FETCH FSM → Port A
-│   ├── data_mem_ctrl.sv        # LOAD/STORE + tri-state → Port B
-│   └── sram_macro.sv           # 1024×32 dual-port SRAM model
+│   ├── chip_top.v          # Physical chip top: C2S0284, pad ring, host byte-mux
+│   ├── gpu.v               # GPU wrapper: reset_sync + compute_core
+│   ├── compute_core.v      # 4-warp FSM, 16-lane datapath, LOAD/STORE sequencing
+│   ├── simd_wrapper.v      # 512-bit datapath: 16× ALU with lane masking
+│   ├── alu.v               # 32-bit ALU: ADD/SUB/AND/OR/XOR
+│   ├── regfile.v           # 16×32-bit register file (one instance per lane)
+│   ├── scoreboard.v        # Per-warp RAW hazard detection
+│   ├── reset_sync.v        # 2-FF async reset synchronizer
+│   ├── shared_mem.v        # DPRAM wrapper (Port A read-only, Port B R/W)
+│   └── rd3_1024x32.v       # SCL 180nm DPRAM macro stub (synthesis/P&R)
 ├── test/
-│   ├── test_vecadd.py          # cocotb testbench: vector addition
-│   ├── test_dotprod.py         # cocotb testbench: dot product
+│   ├── test_vecadd.py      # cocotb testbench: vector addition
+│   ├── test_dotprod.py     # cocotb testbench: dot product
 │   └── logs/
 ├── docs/
 │   └── images/
