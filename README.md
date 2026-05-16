@@ -1,4 +1,4 @@
-# simd-gpu
+# vortex16-gpu
 
 A single-core SIMD GPU with a **512-bit datapath**, **16 parallel ALU lanes**, 4-warp round-robin scheduling, a per-warp scoreboard, and an 8-bit byte-multiplexed host interface — built to explore how real GPU parallelism works from the ground up.
 
