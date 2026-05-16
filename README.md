@@ -66,7 +66,7 @@ The core design philosophy: **no cache, no ambiguity.** By targeting a synchrono
 
 ## Architecture
 
-![GPU Architecture](docs/images/gpu_architecture_diagram.png)
+![GPU Architecture](doc/gpu_architecture_diagram.png)
 
 The diagram above shows the full hierarchy from physical pads down to the SRAM macro. The annotated block breakdown follows.
 
@@ -617,9 +617,8 @@ simd-gpu/
 │   ├── test_vecadd.py      # cocotb testbench: vector addition
 │   ├── test_dotprod.py     # cocotb testbench: dot product
 │   └── logs/
-├── docs/
-│   └── images/
-│       └── gpu_architecture_diagram.png
+├── doc/
+│   └── gpu_architecture_diagram.png
 ├── Makefile
 ├── .gitignore
 └── README.md
