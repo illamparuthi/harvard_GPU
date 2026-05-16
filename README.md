@@ -10,13 +10,13 @@ Implemented in Verilog and taped out on the **SCL 180nm** process (`C2S0284`), w
 
 - [Overview](#overview)
 - [Architecture](#architecture)
-  - [Chip Top Level](#chip-top-level)
-  - [GPU Module](#gpu-module)
-  - [Compute Core](#compute-core)
+  - [Full Hierarchy Diagram](#architecture)
+  - [Chip Top Level & Host Interface](#chip-top-level)
+  - [GPU Module & Reset Synchronizer](#gpu-module)
+  - [Compute Core & Warp Scheduler](#compute-core)
   - [SIMD Wrapper](#simd-wrapper)
   - [Register Files](#register-files)
   - [Scoreboard](#scoreboard)
-  - [Reset Synchronizer](#reset-synchronizer)
   - [Shared Memory](#shared-memory)
 - [Global Memory](#global-memory)
   - [Dual-Port SRAM Macro](#dual-port-sram-macro)
@@ -66,27 +66,104 @@ The core design philosophy: **no cache, no ambiguity.** By targeting a synchrono
 
 ## Architecture
 
-### Chip Top Level (`C2S0284`)
+![GPU Architecture](docs/images/gpu_architecture_diagram.png)
 
-The physical chip module wraps the GPU and SRAM with SCL 180nm pad cells and implements the host-facing byte-multiplexed interface.
+The diagram above shows the full hierarchy from physical pads down to the SRAM macro. The annotated block breakdown follows.
 
 ```
-C2S0284 (chip_top)
-├── SCL Pad Ring
-│   ├── pc3c01  — clock input pad + buffer
-│   ├── pc3d01  — digital input pads (rst_n, start, host_data_in[7:0], host_addr[9:0], ...)
-│   └── pc3o05  — output drive pads (done, host_data_out[7:0], host_ack)
+chip_top — C2S0284
+│  IO Pad Ring · Host Byte-to-Word Assembler · Memory Arbiter · GPU · SRAM Macro
 │
-├── Host Byte-Multiplexed Write Path
-│   ├── write_buffer[23:0]     — accumulates bytes 0–2 on rising edges
-│   └── full_host_word[31:0]   — assembled on byte_sel == 2'b11 (byte 3 arrives)
+├── IO Pad Ring
+│   ├── pc3c01  — clock input pad + clock buffer
+│   ├── pc3d01  — digital input pads
+│   │             clk · rst_n · start · host_data_in[7:0]
+│   │             host_addr[9:0] · host_we · host_byte_sel[1:0]
+│   └── pc3o05  — output drive pads
+│                 done · host_data_out[7:0] · host_ack
 │
-├── Port B Arbitration
-│   ├── start == 0  →  host controls Port B (load program/data)
-│   └── start == 1  →  GPU controls Port B (kernel execution)
+├── Host Interface (Byte-to-Word Assembler)
+│   ├── host_data_in[7:0]     — 8-bit byte-mux data input
+│   ├── write_buffer[23:0]    — accumulates bytes 0–2 on rising edges
+│   ├── host_byte_sel[1:0]    — selects byte lane (00–11)
+│   └── full_host_word[31:0]  — assembled when byte_sel == 2'b11
+│                               writes 32-bit word to Port B via Arbiter
 │
-├── shared_mem (rd3_1024x32)   — 1-cycle DPRAM macro
-└── gpu                        — compute engine
+├── Arbiter / Memory Multiplexer
+│   ├── start == 0  →  host controls Port B  (preload)
+│   └── start == 1  →  GPU compute_core controls Port B
+│                       mem_addr · mem_we · mem_data mux
+│
+└── GPU Wrapper (gpu.v)
+    │
+    ├── Reset Synchronizer (reset_sync.v)
+    │   rst_n (async, active-low) → rst (sync, active-high)
+    │   2-stage flip-flop synchronizer
+    │
+    └── Compute Core (compute_core.v)
+        │  Multi-Warp SIMD Engine · 4 Hardware Warps · 16 Vector Lanes · 512-bit Datapath
+        │
+        ├── FSM Controller
+        │   5 Execution States:
+        │   IDLE · WAIT_FETCH · EXECUTE · WAIT_MEM_LOAD · WAIT_MEM_STORE
+        │   core_stall · pc_inc · req_wr
+        │   mem_req · mem_we · pipeline ctrl
+        │   Drives warp scheduling & stall logic
+        │
+        ├── Warp Scheduler
+        │   4 Independent Hardware Warps
+        │   PC[0] … PC[3]  — per-warp counters
+        │   warp_id  — round-robin increment
+        │   warp_id mux  — FSM controller link
+        │   pc[0:3] register array
+        │   stall propagation per warp
+        │
+        ├── Scoreboard (scoreboard.v)
+        │   In-flight Register Hazard Tracking
+        │   16 registers × 4 warps
+        │   RAW / WAW hazard prevention
+        │   busy_reg[15:0][3:0] tracking
+        │   core_stall → pipeline freeze
+        │   Prevents WAW & RAW collisions
+        │
+        ├── 16 × Vector Lanes  (regfile.v) — generate block instantiation
+        │   16-deep × 32-bit Register Files · 16 lanes × 32-bit = 512-bit total SIMD vector width
+        │
+        │   Lane 0   Lane 1   Lane 2   Lane 3   Lane 4   Lane 5   Lane 6   Lane 7
+        │   rf[0]    rf[1]    rf[2]    rf[3]    rf[4]    rf[5]    rf[6]    rf[7]
+        │   16×32b   16×32b   16×32b   16×32b   16×32b   16×32b   16×32b   16×32b
+        │
+        │   Lane 8   Lane 9   Lane 10  Lane 11  Lane 12  Lane 13  Lane 14  Lane 15
+        │   rf[8]    rf[9]    rf[10]   rf[11]   rf[12]   rf[13]   rf[14]   rf[15]
+        │   16×32b   16×32b   16×32b   16×32b   16×32b   16×32b   16×32b   16×32b
+        │
+        │   simd_a[511:0]  ·  simd_b[511:0]  →  (to SIMD Execution Wrapper)
+        │
+        ├── SIMD Execution Wrapper (simd_wrapper.v) — 512-bit datapath
+        │   simd_a[511:0] · simd_b[511:0]  fed from 16 regfile pairs
+        │   16 parallel 32-bit ALUs
+        │   ops:  ADD / SUB / AND / OR / XOR  —  3-bit opcode
+        │   16-bit lane mask → conditional per-lane execution
+        │   simd_out[511:0]
+        │   rf_wd[0:15] writeback → result distributed to 16 regfiles
+        │
+        └── Memory Coalescing / Serialization
+            512-bit vector register → 16 sequential 32-bit memory accesses  (lane_ctr[3:0])
+            WAIT_MEM_LOAD & WAIT_MEM_STORE states — serialized over 16 cycles
+            mem_req · mem_we · mem_addr[9:0] · mem_data[31:0] buses
+            Instruction Fetch → Port A (always read-only)
+            Data ops → Port B
+
+Global Memory
+  Dual-Port SRAM Macro — rd3_1024x32  (1024 words × 32 bits)
+
+  Port A (Read-Only)              Port B (Read/Write)
+  ─────────────────────────────   ──────────────────────────────────
+  Instruction Fetch               Data Load/Store & Host Access
+  WEB1 fixed HIGH · CSB1 LOW      Driven by Arbiter (Host or GPU)
+  SCL 180nm · 10-bit address bus  32-bit mem_data bus · 10-bit addr
+  32-bit instruction word out     Serialized LOAD → 16 vector lanes
+  instr_addr[9:0] → instr_data    data_addr[9:0] → mem_data[31:0]
 ```
 
 **Key chip-level signals:**
@@ -109,46 +186,13 @@ C2S0284 (chip_top)
 
 ### GPU Module
 
-The `gpu` module is a thin wrapper that instantiates the reset synchronizer and the single compute core.
-
-```
-gpu
-├── reset_sync     — 2-FF synchronizer (rst_n → rst)
-└── compute_core   — all execution logic
-```
-
-External memory ports are passed through directly to `compute_core`. The `cfg[5:0]` input is reserved for future configuration.
+The `gpu` module is a thin wrapper that instantiates the reset synchronizer and the single compute core. External memory ports are passed through directly to `compute_core`. The `cfg[5:0]` input is reserved for future configuration.
 
 ---
 
 ### Compute Core
 
-The compute core is the heart of the GPU. It implements a **4-warp FSM** with a **16-lane SIMD datapath** and handles all instruction fetch, decode, execute, and memory access.
-
-```
-compute_core
-├── pc[0:3]          — independent 10-bit program counters, one per warp
-├── warp_id          — 2-bit active warp selector (round-robin)
-├── instr_addr       — pc[warp_id] driven to Port A
-│
-├── Instruction Decode
-│   ├── opcode[31:24]
-│   ├── rd[23:20]
-│   ├── rs1[19:16]
-│   ├── rs2[15:12]
-│   └── addr[9:0]
-│
-├── 16× regfile      — one per SIMD lane (16 × 32-bit registers each)
-├── simd_a[511:0]    — packed operand A (16 × 32-bit)
-├── simd_b[511:0]    — packed operand B (16 × 32-bit)
-├── simd_wrapper     — 16× parallel 32-bit ALU with lane masking
-├── simd_out[511:0]  — packed ALU results
-├── rf_wd[0:15]      — writeback data per lane (ALU result or load data)
-├── rf_we_bus[15:0]  — per-lane write enable (one-hot during LOAD sequencing)
-│
-├── scoreboard       — per-warp RAW hazard detection
-└── lane_ctr[3:0]    — sequencing counter for LOAD/STORE (0–15)
-```
+The compute core is the heart of the GPU — a **4-warp FSM** driving a **16-lane SIMD datapath**. It handles all instruction fetch, decode, execute, and memory access.
 
 **FSM states:**
 
@@ -575,7 +619,7 @@ simd-gpu/
 │   └── logs/
 ├── docs/
 │   └── images/
-│       └── gpu_architecture.png
+│       └── gpu_architecture_diagram.png
 ├── Makefile
 ├── .gitignore
 └── README.md
